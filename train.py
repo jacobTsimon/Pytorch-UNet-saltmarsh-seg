@@ -18,11 +18,36 @@ from evaluate import evaluate
 from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
+from utils.utils import onehot_to_rgb
+#new metrics and code for creating + saving confusion matrices
+import utils.metrics as metrics
+from utils.metrics import save_confusion_matrix
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
+dir_img = Path('/home/hopkinsonlab/Documents/ML/Segmentation/marsh_plants/Pytorch-UNet-saltmarsh-seg/Pytorch-UNet-saltmarsh-seg/data/trainimgs_sized/')
+dir_mask = Path('/home/hopkinsonlab/Documents/ML/Segmentation/marsh_plants/Pytorch-UNet-saltmarsh-seg/Pytorch-UNet-saltmarsh-seg/data/masks_clean_sized/')
 dir_checkpoint = Path('./checkpoints/')
+#class names
+class_names = ['Sarcocornia','Batis','deadSpartina','Spartina','Juncus','Borrichia','Limonium',"Other",'background']
+classmap = {
+            (255, 255, 255): 8,  # background
+            #(150, 255, 14): 0,  # Background_alt
+            (127, 255, 140): 3,  # Spartina
+            (113, 255, 221): 2,  # dead Spartina
+            (99, 187, 255): 0,  # Sarcocornia
+            (101, 85, 255): 1,  # Batis
+            (212, 70, 255): 4,  # Juncus
+            (255, 56, 169): 5,  # Borrichia
+            (255, 63, 42): 6,  # Limonium
+            (255, 202, 28): 7  # Other
+            #(0  ,   0,  0): 255 # ignore
+}
 
+#ISSUES TO FIX:
+#  X batching doesnt work because some images are different sizes than others. could also be causing the accuracy issues...
+#  X background alt is prevalent in lots of images and causing issues with number of classes
+#   lr scheduler not stepping properly
+#   look into loss metrics
+#   double check confusion matrix + newmetrics are batching properly
 
 def train_model(
         model,
@@ -31,12 +56,17 @@ def train_model(
         batch_size: int = 1,
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
+        test_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        best_score = 0.0,
+        mod_ID = "testrunv2",
+        logfile = open("logfile.txt","a")
+
 ):
     # 1. Create dataset
     try:
@@ -46,13 +76,16 @@ def train_model(
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    n_test = int(len(dataset) * test_percent)
+    n_exc = n_val + n_test
+    n_train = len(dataset) - n_exc
+    train_set, val_set, test_set = random_split(dataset, [n_train, n_val, n_test], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
+    test_loader = DataLoader(test_set, shuffle=False, drop_last=True, **loader_args)
 
     # (Initialize logging)
     experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
@@ -67,6 +100,7 @@ def train_model(
         Learning rate:   {learning_rate}
         Training size:   {n_train}
         Validation size: {n_val}
+        Test size:       {n_test}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
         Images scaling:  {img_scale}
@@ -74,12 +108,14 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+    optimizer = optim.Adam(model.parameters(),
+                              lr=learning_rate, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer,step_size=200,gamma=0.08)             #ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
+    #initiate added evaluator
+    new_metrics = metrics.Evaluator(model.n_classes)
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
@@ -94,7 +130,7 @@ def train_model(
                     f'but loaded images have {images.shape[1]} channels. Please check that ' \
                     'the images are loaded correctly.'
 
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+                images = images.to(device=device, dtype=torch.float32) #, memory_format=torch.channels_last
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
@@ -104,11 +140,11 @@ def train_model(
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                     else:
                         loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+                        # loss += dice_loss(
+                        #     F.softmax(masks_pred, dim=1).float(),
+                        #     F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                        #     multiclass=True
+                        # )
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -138,26 +174,51 @@ def train_model(
                                 histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
                             if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
                                 histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+                        #
+                        val_score = evaluate(model, val_loader, device, amp,exp = experiment,newmetrics=new_metrics)
+                        scheduler.step(epoch) #val_score was formerly entered for the flawed Plateau scheduler
 
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
+                        logging.info('Validation Dice score: {}'.format(val_score["DICE"]))
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
+                        newpred = val_score["MIOU"]
+                        if newpred > best_score:
+                            save_confusion_matrix(new_metrics.confusion_matrix,class_names=class_names,file_name="{}_best_val_confmat.jpg".format(mod_ID))
+                            torch.save(model.state_dict(),"./models/validation/best_val_mod_{}.pth".format(mod_ID))
+                            logfile.write("best {} val mod @ epoch {} achieved MIOU of {}".format(mod_ID,epoch,newpred))
+                        rgb_truemask = onehot_to_rgb(true_masks.float().cpu(), classmap)
+                        rgb_predmask = onehot_to_rgb(masks_pred.float().cpu(), classmap,pred = True)
+
                         try:
                             experiment.log({
                                 'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
+                                'validation Dice': val_score["DICE"],
+                                'validation mIoU': val_score["MIOU"],
+                                'validation Pixel Acc': val_score["ACC"],
+                                'validation Pixel ACC per class': val_score["ACC_CLASS"],
                                 'images': wandb.Image(images[0].cpu()),
+                                'ConfMat':wandb.Image(val_score["CONFMAT"]),
                                 'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
+                                    'true': wandb.Image(rgb_truemask),
+                                    'pred': wandb.Image(rgb_predmask),
                                 },
                                 'step': global_step,
                                 'epoch': epoch,
                                 **histograms
+
                             })
                         except:
+                            print("logging failed...")
                             pass
+#confusion matrix not possible with base function
+                        # true = true_masks.argmax(axis=1)
+                        # pred = masks_pred.argmax(axis=1)
+                        #
+                        # experiment.log({
+                        #     'confmatrix': wandb.plot.confusion_matrix(y_true=true,
+                        #                                               preds=pred,
+                        #                                               class_names=class_names)
+                        # })
+
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -165,6 +226,21 @@ def train_model(
             state_dict['mask_values'] = dataset.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
+
+
+
+    #testing chunk
+    test_score = evaluate(model, test_loader, device, amp, exp=experiment, newmetrics=new_metrics,set = 'test')
+    experiment.log({
+        'Test ConfMat': wandb.Image(test_score["CONFMAT"]),
+        'test Dice': test_score["DICE"],
+        'test mIoU': test_score["MIOU"],
+        'test Pixel Acc': test_score["ACC"],
+        'test Pixel ACC per class': test_score["ACC_CLASS"],
+    })
+    torch.save(model.state_dict(), "./models/testing/best_test_mod_{}.pth".format(mod_ID))
+
+    logfile.close()
 
 
 def get_args():
@@ -177,6 +253,8 @@ def get_args():
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
+    parser.add_argument('--testing', '-t', dest='test', type=float, default=10.0,
+                        help='Percent of the data that is used as testing (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
@@ -218,6 +296,7 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
+            test_percent=args.test / 100,
             amp=args.amp
         )
     except torch.cuda.OutOfMemoryError:
@@ -234,5 +313,7 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
+            test_percent=args.test / 100,
             amp=args.amp
         )
+
